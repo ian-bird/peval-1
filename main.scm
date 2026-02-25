@@ -23,11 +23,6 @@
 	((eq? expr param) arg)
 	(else expr)))
 
-;;; this checks if a variable in the environment is an unbound variable.
-;;; this is critical since when we're performing partial evaluation many
-;;; variables remain unbound.
-(define (unbound? v) (and (pair? v) (eq? (car v) 'unbound)))
-
 ;;; do one partial evaluation step. The form yielded may not be optimal,
 ;;; so this may need to be applied again. I don't know if this can result
 ;;; in a cycle.
@@ -43,9 +38,14 @@
 ;;; 3) we can apply these rules inside the body of an unapplied lambda,
 ;;;    as long as we remember it's parameter is unbound.
 (define (peval-step expr env)
-  (let ((lambda? (lambda (x) (and (list? x) (eq? 'lambda (car x)) (= (length x) 3)))))
+  (let ((lambda? (lambda (x) (and (list? x) (eq? 'lambda (car x)) (= (length x) 3))))
+	(unbound? (lambda (v) (and (pair? v) (eq? (car v) 'unbound)))))
     ;; if we get a symbol then look it up and return the binding
-    (cond ((symbol? expr) (cdr (assq expr env)))
+    (cond ((symbol? expr)
+	   (let ((lookup (cdr (assq expr env))))
+	     (if (unbound? lookup)
+		 (cdr lookup)
+		 lookup)))
 	  ((number? expr) expr)
 	  ;; if its a lambda expression, then peval the body,
 	  ;; and then if it's unbound just return the var name,
@@ -72,18 +72,14 @@
 					 (cadr lambda-expr)
 					 (cadr expr))
 		     (list lambda-expr
-			   (peval-step (cadr expr) env))))))
-	  ((and (pair? expr) (eq? 'unbound (car expr)))
-	   (cdr expr)))))
+			   (peval-step (cadr expr) env)))))))))
 
 ;; repeatedly perform reduction steps to a form until we reach one we've seen before.
 (define (peval expr env)
-  (let loop ((expr expr)
-	     (seen (list expr)))
-    (let ((next-step (peval-step expr env)))
-      (if (member next-step seen)
-	  next-step
-	  (loop next-step (cons expr seen))))))
+  (let ((next-step (peval-step expr env)))
+      (if (equal? expr next-step)
+	  expr
+	  (peval next-step env))))
 
 ;; examples:
 ;; let car = \c.c(\a.\b.a)
