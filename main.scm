@@ -1,124 +1,85 @@
-(define (eval. form env)
-  (cond ((number? form) form)
-	((boolean? form) form)
-	((char? form) form)
-	((string? form) form)
-	((symbol? form) (lookup form env))
-	((pair? form)
-	 (let ((check-arity (lambda (n or-more?)
-			      (unless ((if or-more? <= =) n (length (cdr form)))
-				(error `("bad arity in " ,form ": got" ,(length (cdr form))
-					 expected ,n ,@(if or-more? '("or more") '())))))))
-	   (case (car form)
-	     ((quote) (check-arity 1 #f)
-	      (cadr form))
-	     ((car) (check-arity 1 #f)
-	      (car (eval. (cadr form) env)))
-	     ((cdr) (check-arity 1 #f)
-	      (cdr (eval. (cadr form) env)))
-	     ((cons) (check-arity 2 #f)
-	      (cons (eval. (cadr form) env) (eval. (caddr form) env)))
-	     ((eq?) (apply eq? (evlis (cdr form) env)))
-	     ((atom?) (check-arity 1 #f)
-	      (not (pair? (eval. (cadr form) env))))
-	     ((lambda) (check-arity 2 #f)
-	      (list (cons 'env env)
-		    (cons 'args (cadr form))
-		    (cons 'body (caddr form))))
-	     ((if) (check-arity 3 #f)
-	      (if (eval. (cadr form) env)
-		  (eval. (caddr form) env)
-		  (eval. (cadddr form) env)))
-	     (else
-	      (let ((fn (eval. (car form) env)))
-		(unless (or (procedure? fn)
-			    (every? (lambda (k) (assoc k fn)) '(env args body)))
-		  (error `(wrong type to apply: ,(car form))))
-		(apply. fn
-		 (evlis (cdr form) env)))))))
-	(else (error 'invalid-type form))))
+;;; this implemented a combined step for alpha and beta reduction.
+;;; it steps through a lambda expression looking for instances of the parameter
+;;; being worked on and replacing it with the given argument.
+;;; alpha reduction is done by providing a gensym as the argument to rename it.
+(define (combined-reduction expr param arg)
+  ;; if we get a lambda, we need to do alpha reduction before we can
+  ;; do beta reduction on the body.
+  (cond ((and (list? expr)  (eq? 'lambda (car expr)))
+	 (let ((new-sym (gensym)))
+	   `(lambda
+		,new-sym
+	      ,(combined-reduction (combined-reduction (caddr expr)
+						       (cadr expr)
+						       new-sym)
+				   param
+				   arg))))
+	;; if its an application then try to reduce both
+	((list? expr)
+	 (map (lambda (sub-expr)
+		(combined-reduction sub-expr param arg))
+	      expr))
+	;; if its a symbol then replace it if its equal to the param
+	((eq? expr param) arg)
+	(else expr)))
 
+;;; this checks if a variable in the environment is an unbound variable.
+;;; this is critical since when we're performing partial evaluation many
+;;; variables remain unbound.
+(define (unbound? v) (and (pair? v) (eq? (car v) 'unbound)))
 
+;;; do one partial evaluation step. The form yielded may not be optimal,
+;;; so this may need to be applied again. I don't know if this can result
+;;; in a cycle.
+;;;
+;;; the basic idea is as follows:
+;;; 1) bindings in env can be expanded ahead of time to their lambda expressions.
+;;;    (it should be noted that named variables is an extension of the pure lambda calculus,
+;;;     but it makes testing easier)
+;;;
+;;; 2) application of lambda expressions can be beta-reduced as long as the function
+;;;    isn't an unbound variable.
+;;;
+;;; 3) we can apply these rules inside the body of an unapplied lambda,
+;;;    as long as we remember it's parameter is unbound.
+(define (peval-step expr env)
+  ;; if we get a symbol then look it up and return the binding
+  (cond ((symbol? expr)
+	 (cdr (assoc expr env)))
+	((number? expr) expr)
+	;; if its a lambda expression, then peval the body,
+	;; and then if it's unbound just return the var name,
+	;; otherwise return the pevaled body.
+	((and (list? expr) (eq? 'lambda (car expr)))
+	 (let ((body (peval-step (caddr expr)
+				 (acons (cadr expr)
+					(cons 'unbound (cadr expr))
+					env))))
+	   `(lambda ,(cadr expr) ,(if (unbound? body) (cdr body) body))))
+	;; if its an application, then peval the lambda.
+	;; if its unbound, then put the var name in the function call slot,
+	;; and peval the argument. Just return that, since we can't do more.
+        ((list? expr)
+	 (let ((lambda-expr (peval-step (car expr) env)))
+	   (if (unbound? lambda-expr)
+	       (list (cdr lambda-expr)
+		     (peval-step (cadr expr) env))
+	       ;; if it's not unbound, then we can do a beta reduction,
+	       ;; by replacing the application with the lambda body that has had its
+	       ;; parameter replaced with the argument.
+	       (combined-reduction (caddr lambda-expr)
+				   (cadr lambda-expr)
+				   (cadr expr)))))))
 
-;; we can do constant folding
-;; and inlining.
-;; inlining will be limited to 10 levels.
-;; we cannot tell if we wil be able to inline
-;; in the general case (see collatz conjecture)
-;; so we'll just give up if things go beyond 10 levels.
-;;
-;; as long as code stays purely functional inlining is always safe.
-(define (peval form env depth)
-  ;; if a binding isnt found in the env than instead of erroring we'll leave it unbound
-  (cond ((number? form) form)
-	((boolean? form) form)
-	((char? form) form)
-	((string? form) form)
-	((symbol? form)
-	 (with-exception-handler
-	     (lambda _ form)
-	   (lambda () (lookup form env))))
-	((pair? form)
-	 (case (car form)
-	   ((quote) form)
-	   ((car)
-	    (let ((arg-peval (peval (cadr form) env (1+ depth))))
-	      (if (eq? 'quote (car arg-peval))
-		  (car ))))))))
+;; works by repeatedly performing reduction steps to a form until it doesn't change.
+(define (peval expr env)
+  (let ((next-step (peval-step expr env)))
+    (if (equal? next-step expr)
+	expr
+	(peval next-step env))))
 
-(any? (lambda (pred) (pred x)) '(boolean? number? string? char?))
+(peval '(lambda a (lambda b  (car. ((cons. a) b))))
+       `( ,(cons 'cons. '(lambda a (lambda b (lambda c ((c a) b)))))
+	  ,(cons 'car. '(lambda c (c (lambda a (lambda b a)))))))
 
-(define (any? pred seq)
-  (if (eq? '() seq)
-      #f
-      (if (pred (car seq))
-	  #t
-	  (any? pred (cdr seq)))))
-
-(if (boolean? x) 
-       #t
-       (if (number? x)
-	   #t
-	   (if (string? x)
-	       #t
-	       #f)))
-
-
-(define (every? proc seq)
-  (call/cc (lambda (done)
-	     (for-each (lambda (v)
-			 (unless (proc v)
-			   (done #f)))
-		       seq)
-	     #t)))
-
-(define (evlis forms env)
-  (map (lambda (form) (eval. form env)) forms))
-
-(define (last list)
-  (if (null? (cdr list))
-      (car list)
-      (last (cdr list))))
-
-(define (bind params args)
-  (cond ((symbol? params) (list (cons params args)))
-	((and (null? params) (null? args)) '())
-	((null? params) (error `(got ,(length args) extra arguments)))
-	((null? args) (error `(expected ,(length params) extra arguments)))
-	(else (acons (car params) (car args) (bind (cdr params) (cdr args))))))
-
-(define (apply. proc args)
-  (if (procedure? proc)
-      (apply proc args)
-      (eval. (cdr (assoc 'body proc))
-	     (cons (bind (cdr (assoc 'args proc)) args)
-		   (cdr (assoc 'env proc))))))
-
-(define (lookup v env)
-  (call/cc (lambda (done)
-	     (for-each (lambda (frame)
-			 (when (assoc v frame)
-			   (done (cdr (assoc v frame)))))
-		       env)
-	     (eval v (interaction-environment)))))
 
